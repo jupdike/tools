@@ -75,6 +75,7 @@ setup(
         "roman==3.2.0",
         "selenium==3.141.0",
         "smartypants==2.0.1",
+        "svgpathtools==1.3.3",
         "termcolor==1.1.0",
         "terminaltables==3.1.0",
         "tinycss2==1.0.2",

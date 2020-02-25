@@ -7,11 +7,16 @@ from pathlib import Path
 import tempfile
 
 import regex
+from cairosvg import svg2svg
 from PIL import Image, ImageMath
+from svgpathtools import parse_path
 
 import se
 import se.formatting
 
+
+LETTER_SPACING = 6.25 # In px; must match the letter-spacing value in titlepage and cover page CSS
+DPI_MODIFIER = 1.25
 
 def _color_to_alpha(image: Image, color=None) -> Image:
 	"""
@@ -100,6 +105,83 @@ def _color_to_alpha(image: Image, color=None) -> Image:
 
 	return new_image
 
+def svg_text_to_paths(svg_xml: str) -> str:
+	"""
+	Convert SVG <text> elements to <path>s with cairosvg
+
+	INPUTS
+	svg_xml: An SVG file as a string
+
+	OUTPUTS
+	A string of XML representing the new SVG
+	"""
+
+	# Save the title for later, as cairosvg removes it
+	try:
+		title_element = regex.findall(r"<title>.+?</title>", svg_xml)[0]
+	except:
+		raise se.InvalidInputException("titlepage.svg is missing the <title> element.")
+
+	# Now transform text to paths
+	# dpi=90 is a magic number. Not sure why we need to specify this.
+	processed_svg_xml = svg2svg(bytestring=svg_xml.encode(), dpi=90).decode()
+
+	# cairosvg has a bug where text that has letter-spacing is not centered correctly.
+	# To work around that, we try to calculate the width of each line, then center it manually by
+	# moving each character left individually.
+
+	canvas_width = se.TITLEPAGE_WIDTH / DPI_MODIFIER
+
+	# Now iterate over each line and center it
+	for line in set(regex.findall(r"<g style=\"[^\"]+?\">\s+<use .*?y=\"([^\"]+?)\"", processed_svg_xml, flags=regex.DOTALL)):
+		# Get the first and last glyph ID for later
+		matches = regex.findall(fr"<use xlink:href=\"#([^\"]+?)\" x=\"([^\"]+?)\" y=\"{line}\"", processed_svg_xml)
+		first_glyph_id = matches[0][0]
+		last_glyph_id = matches[len(matches) - 1][0]
+
+		# Calculate the line width in native units (pt), except for the last char
+		base_x = float(matches[0][1])
+		line_width = float(matches[len(matches) - 1][1]) - base_x
+
+		# Get the width of the first char; for some reason its path might be in a negative axis, so we have to adjust for that
+		matches = regex.findall(fr"<symbol .*?id=\"{first_glyph_id}\">\s*<path .*?d=\"([^\"]+?)\"", processed_svg_xml, flags=regex.DOTALL)
+		path = parse_path(matches[0])
+		bbox = path.bbox()
+		line_width += bbox[0] + (LETTER_SPACING * DPI_MODIFIER) # cairosvg outputs in pt, so we have to adjust with a DPI modifier
+
+		# Get the width of the last char and then the final line width
+		matches = regex.findall(fr"<symbol .*?id=\"{last_glyph_id}\">\s*<path .*?d=\"([^\"]+?)\"", processed_svg_xml, flags=regex.DOTALL)
+		path = parse_path(matches[0])
+		bbox = path.bbox()
+		line_width += bbox[1] - bbox[0]
+
+		# This is how much we have to pull the line left
+		x_modifier = (base_x - ((canvas_width - line_width) / 2))
+
+		# Now iterate over the chars in the line and move them all left by the modifier amount
+		matches = regex.findall(fr"<use xlink:href=\"#([^\"]+?)\" x=\"([^\"]+?)\" y=\"{line}\"", processed_svg_xml)
+
+		for match in matches:
+			last_glyph_id = match[0]
+			char_x = float(match[1])
+			new_x = char_x - x_modifier
+			processed_svg_xml = regex.sub(fr"<use xlink:href=\"#{last_glyph_id}\" x=\"{char_x}\" y=\"{line}\"", f"<use xlink:href=\"#{last_glyph_id}\" x=\"{new_x}\" y=\"{line}\"", processed_svg_xml)
+
+	# Done re-centering text. Now clean up some of cairosvg's output cruft
+	processed_svg_xml = regex.sub(r"</?g[^>]*?>", "", processed_svg_xml)
+	processed_svg_xml = regex.sub(r" style=\"[^\"]*?\"", "", processed_svg_xml)
+	processed_svg_xml = regex.sub(r" overflow=\"visible\"", "", processed_svg_xml)
+	processed_svg_xml = regex.sub(r"<symbol id=\"glyph[\d]+-[\d]+\">\s*<path d=\"\"/>\s*</symbol>", "", processed_svg_xml, flags=regex.DOTALL)
+	processed_svg_xml = processed_svg_xml.replace(" \"/>", "\"/>")
+
+	# Re-add the title element
+	processed_svg_xml = regex.sub(r"(<svg.+?>)", fr"\1{title_element}", processed_svg_xml)
+
+	# Last cleanup
+	processed_svg_xml = se.formatting.format_xhtml(processed_svg_xml)
+
+	return processed_svg_xml
+
 # Note: We can't type hint driver, because we conditionally import selenium for performance reasons
 def render_mathml_to_png(driver, mathml: str, output_filename: Path) -> None:
 	"""
@@ -126,35 +208,6 @@ def render_mathml_to_png(driver, mathml: str, output_filename: Path) -> None:
 			image = Image.open(png_file.name)
 			image = _color_to_alpha(image, (255, 255, 255, 255))
 			image.crop(image.getbbox()).save(output_filename)
-
-def format_inkscape_svg(filename: Path):
-	"""
-	Clean and format SVGs created by Inkscape, which have lots of useless metadata.
-
-	INPUTS
-	filename: A filename of an Inkscape SVG
-
-	OUTPUTS
-	None.
-	"""
-
-	with open(filename, "r+", encoding="utf-8") as file:
-		svg = file.read()
-
-		# Time to clean up Inkscape's mess
-		svg = regex.sub(r"id=\"[^\"]+?\"", "", svg)
-		svg = regex.sub(r"<metadata[^>]*?>.*?</metadata>", "", svg, flags=regex.DOTALL)
-		svg = regex.sub(r"<defs[^>]*?/>", "", svg)
-		svg = regex.sub(r"xmlns:(dc|cc|rdf)=\"[^\"]*?\"", "", svg)
-
-		# Inkscape includes CSS even though we've removed font information
-		svg = regex.sub(r" style=\".*?\"", "", svg)
-
-		svg = se.formatting.format_xhtml(svg)
-
-		file.seek(0)
-		file.write(svg)
-		file.truncate()
 
 def remove_image_metadata(filename: Path) -> None:
 	"""

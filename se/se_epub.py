@@ -10,8 +10,6 @@ import datetime
 import fnmatch
 import html
 import os
-import shutil
-import subprocess
 import tempfile
 from pathlib import Path
 from typing import List, Optional
@@ -460,34 +458,14 @@ class SeEpub:
 		None.
 		"""
 
-		which_inkscape = shutil.which("inkscape")
-		if which_inkscape:
-			inkscape_path = Path(which_inkscape)
-		else:
-			raise se.MissingDependencyException("Couldn’t locate Inkscape. Is it installed?")
+		source_svg_filename = self.path / "images" / "titlepage.svg"
+		dest_svg_filename = self.path / "src" / "epub" / "images" / "titlepage.svg"
 
-		source_images_directory = self.path / "images"
-		source_titlepage_svg_filename = source_images_directory / "titlepage.svg"
-		dest_images_directory = self.path / "src" / "epub" / "images"
-		dest_titlepage_svg_filename = dest_images_directory / "titlepage.svg"
+		if source_svg_filename.is_file():
+			with open(source_svg_filename, "r") as file:
+				svg = se.images.svg_text_to_paths(file.read())
 
-		if source_titlepage_svg_filename.is_file():
-			# Convert text to paths
-			# inkscape adds a ton of crap to the SVG and we clean that crap a little later.
-			# 1.0 needs an --export-file flag that 0.92 doesn’t, so we need to normalise that first.
-			output_file_flag = str(dest_titlepage_svg_filename)
-			if "--export-file=" in subprocess.run([str(inkscape_path), "--without-gui", "--help"], stdout=subprocess.PIPE, check=True).stdout.decode("utf8"):
-				output_file_flag = "--export-file=" + output_file_flag
-			# Path arguments must be cast to string for Windows compatibility.
-			subprocess.run([str(inkscape_path), str(source_titlepage_svg_filename), "--without-gui", "--export-text-to-path", "--export-plain-svg", output_file_flag], stderr=subprocess.DEVNULL, check=True)
-
-			se.images.format_inkscape_svg(dest_titlepage_svg_filename)
-
-			# For the titlepage we want to remove all styles, since they are not used anymore
-			with open(dest_titlepage_svg_filename, "r+", encoding="utf-8") as file:
-				svg = regex.sub(r"<style.+?</style>[\n\t]+", "", file.read(), flags=regex.DOTALL)
-
-				file.seek(0)
+			with open(dest_svg_filename, "w") as file:
 				file.write(svg)
 				file.truncate()
 
@@ -501,11 +479,6 @@ class SeEpub:
 		OUTPUTS
 		None.
 		"""
-
-		inkscape_path = shutil.which("inkscape")
-
-		if inkscape_path is None:
-			raise se.MissingDependencyException("Couldn’t locate Inkscape. Is it installed?")
 
 		source_images_directory = self.path / "images"
 		source_cover_jpg_filename = source_images_directory / "cover.jpg"
@@ -529,30 +502,27 @@ class SeEpub:
 				with open(source_cover_jpg_filename, "rb") as binary_file:
 					source_cover_jpg_base64 = base64.b64encode(binary_file.read()).decode()
 
-				# Convert text to paths
-				# Inkscape 1.0 needs an --export-file flag that 0.92 doesn’t, so we need to normalise that first.
-				output_file_flag = str(dest_cover_svg_filename)
-				if "--export-file=" in subprocess.run([str(inkscape_path), "--without-gui", "--help"], stdout=subprocess.PIPE, check=True).stdout.decode("utf8"):
-					output_file_flag = "--export-file=" + output_file_flag
-				# Inkscape adds a ton of crap to the SVG and we clean that crap a little later
-				subprocess.run([str(inkscape_path), str(source_cover_svg_filename), "--without-gui", "--export-text-to-path", "--export-plain-svg", output_file_flag], stderr=subprocess.DEVNULL, check=True)
+				with open(source_cover_svg_filename, "r") as file:
+					svg = file.read()
 
-				# Embed cover.jpg
-				with open(dest_cover_svg_filename, "r+", encoding="utf-8") as file:
-					svg = regex.sub(r"xlink:href=\".*?cover\.jpg", "xlink:href=\"data:image/jpeg;base64," + source_cover_jpg_base64, file.read(), flags=regex.DOTALL)
+				# Remove the image before we hand it over to cairosvg, because cairosvg will save
+				# as PNG which will be huge. We'll re-add it later.
+				svg = regex.sub(r"<image.+?/>", "", svg)
 
-					file.seek(0)
-					file.write(svg)
-					file.truncate()
+				svg = se.images.svg_text_to_paths(svg)
 
-				se.images.format_inkscape_svg(dest_cover_svg_filename)
+				# Style the text white and add a class to style the title box
+				svg = regex.sub(r"</defs>\s*<path", "</defs>\n\t<path class=\"title-box\"", svg)
+				svg = regex.sub(r"<defs>", "<style type=\"text/css\">\n\t\tpath{\n\t\t\tfill: #fff;\n\t\t}\n\n\t\t.title-box{\n\t\t\tfill: #000;\n\t\t\tfill-opacity: .75;\n\t\t}\n\t</style>\n\t<defs>", svg, flags=regex.DOTALL)
 
-				# For the cover we want to keep the path.title-box style, and add an additional
-				# style to color our new paths white
-				with open(dest_cover_svg_filename, "r+", encoding="utf-8") as file:
-					svg = regex.sub(r"<style.+?</style>", "<style type=\"text/css\">\n\t\tpath{\n\t\t\tfill: #fff;\n\t\t}\n\n\t\t.title-box{\n\t\t\tfill: #000;\n\t\t\tfill-opacity: .75;\n\t\t}\n\t</style>", file.read(), flags=regex.DOTALL)
+				# cairosvg saves svgs in pt instead of px, so we have to get the viewbox to get the right height/width
+				# for the background image
+				width, height = regex.findall(r"viewBox=\"[\d+\.]+ [\d+\.]+ ([\d+\.]+) ([\d+\.]+)\"", svg)[0]
 
-					file.seek(0)
+				# Add the background image back in
+				svg = svg.replace("<path class", f"<image height=\"{height}\" width=\"{width}\" x=\"0\" y=\"0\" xlink:href=\"data:image/jpeg;base64,{source_cover_jpg_base64}\"/>\n\t<path class")
+
+				with open(dest_cover_svg_filename, "w") as file:
 					file.write(svg)
 					file.truncate()
 

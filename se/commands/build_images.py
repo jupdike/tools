@@ -25,9 +25,7 @@ def build_images() -> int:
 		if args.verbose:
 			print(f"Processing {directory} ...")
 
-		directory = directory.resolve()
-
-		se_epub = SeEpub(directory)
+		se_epub = SeEpub(directory.resolve())
 
 		try:
 			if args.verbose:
